@@ -60,6 +60,7 @@ func ping(inputTargetIps []net.IP) (<-chan Result, error) {
 
 		wb, err := wm.Marshal(nil)
 		if err != nil {
+			c.Close()
 			return nil, err
 		}
 
@@ -67,6 +68,7 @@ func ping(inputTargetIps []net.IP) (<-chan Result, error) {
 
 		_, err = c.WriteTo(wb, addr)
 		if err != nil {
+			c.Close()
 			return nil, err
 		}
 	}
