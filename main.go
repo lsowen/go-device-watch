@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/internal/iana"
+	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -39,43 +41,74 @@ type Result struct {
 	Error error
 }
 
-func ping(inputTargetIps []net.IP) (<-chan Result, error) {
-	targetIps := make([]net.IP, len(inputTargetIps))
-	copy(targetIps, inputTargetIps)
+func ping(targetIps []net.IP) (<-chan Result, error) {
+	responseChannel := make(chan Result, len(targetIps))
+	wg := &sync.WaitGroup{}
 
-	c, err := icmp.ListenPacket("ip6:ipv6-icmp", "::")
-	if err != nil {
-		return nil, err
-	}
+	processor := func(targetIp net.IP) {
+		wg.Add(1)
+		defer wg.Done()
 
-	for _, targetIp := range targetIps {
+		isIPv6 := targetIp.To4() == nil
 
-		wm := icmp.Message{
-			Type: ipv6.ICMPTypeNeighborSolicitation,
-			Code: 0,
-			Body: &NeighborSolicitation{
+		network := "ip6:ipv6-icmp"
+		if isIPv6 == false {
+			network = "ip4:icmp"
+		}
+
+		c, err := icmp.ListenPacket(network, "")
+		if err != nil {
+			responseChannel <- Result{
+				Type:  ERROR,
+				Error: err,
+				Peer:  targetIp,
+			}
+
+			return
+		}
+		defer c.Close()
+
+		var wm icmp.Message
+		if isIPv6 == false {
+			wm.Type = ipv4.ICMPTypeEcho
+			wm.Code = 0
+			wm.Body = &icmp.Echo{
+				ID:   1,
+				Seq:  1,
+				Data: []byte("ping"),
+			}
+
+		} else {
+			wm.Type = ipv6.ICMPTypeNeighborSolicitation
+			wm.Code = 0
+			wm.Body = &NeighborSolicitation{
 				TargetAddress: targetIp,
-			},
+			}
 		}
 
 		wb, err := wm.Marshal(nil)
 		if err != nil {
-			c.Close()
-			return nil, err
+			responseChannel <- Result{
+				Type:  ERROR,
+				Error: err,
+				Peer:  targetIp,
+			}
+
+			return
 		}
 
 		addr := &net.IPAddr{IP: targetIp}
 
 		_, err = c.WriteTo(wb, addr)
 		if err != nil {
-			c.Close()
-			return nil, err
-		}
-	}
+			responseChannel <- Result{
+				Type:  ERROR,
+				Error: err,
+				Peer:  targetIp,
+			}
 
-	responseChannel := make(chan Result)
-	go func() {
-		defer c.Close()
+			return
+		}
 
 		rb := make([]byte, 1500)
 
@@ -86,70 +119,93 @@ func ping(inputTargetIps []net.IP) (<-chan Result, error) {
 			n, peer, err := c.ReadFrom(rb)
 			if err != nil {
 				if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
-					for _, targetIp := range targetIps {
-						responseChannel <- Result{
-							Type: UNREACHABLE,
-							Peer: targetIp,
-						}
+					responseChannel <- Result{
+						Type: UNREACHABLE,
+						Peer: targetIp,
 					}
 				} else {
 					responseChannel <- Result{
 						Type:  ERROR,
 						Error: err,
+						Peer:  targetIp,
 					}
 				}
-				close(responseChannel)
+
 				return
 			}
 
-			rm, err := icmp.ParseMessage(iana.ProtocolIPv6ICMP, rb[:n])
+			proto := iana.ProtocolIPv6ICMP
+			if isIPv6 == false {
+				proto = iana.ProtocolICMP
+			}
+
+			rm, err := icmp.ParseMessage(proto, rb[:n])
 			if err != nil {
 				responseChannel <- Result{
 					Type:  ERROR,
 					Error: err,
+					Peer:  targetIp,
 				}
-				close(responseChannel)
+
 				return
 			}
 			switch rm.Type {
 			case ipv6.ICMPTypeNeighborAdvertisement:
-				for i, candidateIp := range targetIps {
-					if candidateIp.Equal(peer.(*net.IPAddr).IP) {
-						responseChannel <- Result{
-							Type: REACHABLE,
-							Peer: candidateIp,
-						}
-
-						targetIps = append(targetIps[:i], targetIps[i+1:]...)
-						if len(targetIps) == 0 {
-							close(responseChannel)
-							return
-						}
-						break
+				if targetIp.Equal(peer.(*net.IPAddr).IP) {
+					responseChannel <- Result{
+						Type: REACHABLE,
+						Peer: targetIp,
 					}
+
+					return
 				}
 			case ipv6.ICMPTypeDestinationUnreachable:
 				msg := rm.Body.(*icmp.DstUnreach)
 				destination := make(net.IP, net.IPv6len)
-				copy(destination, msg.Data[24:40])
+				copy(destination, msg.Data[24:24+net.IPv6len])
 
-				for i, candidateIp := range targetIps {
-					if candidateIp.Equal(destination) {
-						responseChannel <- Result{
-							Type: UNREACHABLE,
-							Peer: candidateIp,
-						}
-
-						targetIps = append(targetIps[:i], targetIps[i+1:]...)
-						if len(targetIps) == 0 {
-							close(responseChannel)
-							return
-						}
-						break
+				if targetIp.Equal(destination) {
+					responseChannel <- Result{
+						Type: UNREACHABLE,
+						Peer: targetIp,
 					}
+
+					return
 				}
+			case ipv4.ICMPTypeEchoReply:
+				if targetIp.Equal(peer.(*net.IPAddr).IP) {
+					responseChannel <- Result{
+						Type: REACHABLE,
+						Peer: targetIp,
+					}
+
+					return
+				}
+			case ipv4.ICMPTypeDestinationUnreachable:
+				msg := rm.Body.(*icmp.DstUnreach)
+				destination := make(net.IP, net.IPv4len)
+				copy(destination, msg.Data[16:16+net.IPv4len])
+				if targetIp.Equal(destination) {
+					responseChannel <- Result{
+						Type: UNREACHABLE,
+						Peer: targetIp,
+					}
+
+					return
+				}
+			default:
+				fmt.Printf("Other packet %+v\n", rm)
 			}
 		}
+	}
+
+	for _, targetIp := range targetIps {
+		go processor(targetIp)
+	}
+
+	go func() {
+		wg.Wait()
+		close(responseChannel)
 	}()
 
 	return responseChannel, nil
@@ -186,9 +242,11 @@ func main() {
 			fmt.Println(err)
 		}
 
+		fmt.Println("before")
 		for r := range responseChannel {
-			fmt.Println(r)
+			fmt.Printf("Response Message: %+v\n", r)
 		}
+		fmt.Println("after")
 
 		time.Sleep(time.Duration(callInterval) * time.Second)
 	}
