@@ -5,12 +5,16 @@ import (
 	"flag"
 	"fmt"
 	"golang.org/x/net/icmp"
-	"golang.org/x/net/internal/iana"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 	"net"
 	"sync"
 	"time"
+)
+
+const (
+	ProtocolICMP     = 1
+	ProtocolIPv6ICMP = 58
 )
 
 type NeighborSolicitation struct {
@@ -134,9 +138,9 @@ func ping(targetIps []net.IP) (<-chan Result, error) {
 				return
 			}
 
-			proto := iana.ProtocolIPv6ICMP
+			proto := ProtocolIPv6ICMP
 			if isIPv6 == false {
-				proto = iana.ProtocolICMP
+				proto = ProtocolICMP
 			}
 
 			rm, err := icmp.ParseMessage(proto, rb[:n])
