@@ -43,6 +43,19 @@ type Result struct {
 	Error error
 }
 
+func sendMessage(wm icmp.Message, conn *icmp.PacketConn, address *net.IPAddr) error {
+	wb, err := wm.Marshal(nil)
+	if err != nil {
+		return err
+	}
+
+	_, err = conn.WriteTo(wb, address)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 func pingIp(targetIp net.IP) (result Result) {
 	isIPv6 := targetIp.To4() == nil
 
@@ -63,48 +76,52 @@ func pingIp(targetIp net.IP) (result Result) {
 	}
 	defer c.Close()
 
-	var wm icmp.Message
-	if isIPv6 == false {
-		wm.Type = ipv4.ICMPTypeEcho
-		wm.Code = 0
-		wm.Body = &icmp.Echo{
-			ID:   1,
-			Seq:  1,
-			Data: []byte("ping"),
-		}
-
-	} else {
-		wm.Type = ipv6.ICMPTypeEchoRequest
-		wm.Code = 0
-		wm.Body = &icmp.Echo{
-			ID:   1,
-			Seq:  1,
-			Data: []byte("ping"),
-		}
-	}
-
-	wb, err := wm.Marshal(nil)
-	if err != nil {
-		result = Result{
-			Type:  ERROR,
-			Error: err,
-			Peer:  targetIp,
-		}
-
-		return
-	}
-
 	addr := &net.IPAddr{IP: targetIp}
-
-	_, err = c.WriteTo(wb, addr)
-	if err != nil {
-		result = Result{
-			Type:  ERROR,
-			Error: err,
-			Peer:  targetIp,
+	var messages []icmp.Message
+	if isIPv6 == false {
+		messages = []icmp.Message{
+			icmp.Message{
+				Type: ipv4.ICMPTypeEcho,
+				Code: 0,
+				Body: &icmp.Echo{
+					ID:   1,
+					Seq:  1,
+					Data: []byte("ping"),
+				},
+			},
 		}
+	} else {
+		messages = []icmp.Message{
+			icmp.Message{
+				Type: ipv6.ICMPTypeEchoRequest,
+				Code: 0,
+				Body: &icmp.Echo{
+					ID:   1,
+					Seq:  1,
+					Data: []byte("ping"),
+				},
+			},
+			icmp.Message{
+				Type: ipv6.ICMPTypeNeighborSolicitation,
+				Code: 0,
+				Body: &NeighborSolicitation{
+					TargetAddress: targetIp,
+				},
+			},
+		}
+	}
 
-		return
+	for _, message := range messages {
+		err = sendMessage(message, c, addr)
+		if err != nil {
+			result = Result{
+				Type:  ERROR,
+				Error: err,
+				Peer:  targetIp,
+			}
+
+			return
+		}
 	}
 
 	rb := make([]byte, 1500)
@@ -149,6 +166,15 @@ func pingIp(targetIp net.IP) (result Result) {
 		}
 		switch rm.Type {
 		case ipv6.ICMPTypeEchoReply:
+			if targetIp.Equal(peer.(*net.IPAddr).IP) {
+				result = Result{
+					Type: REACHABLE,
+					Peer: targetIp,
+				}
+
+				return
+			}
+		case ipv6.ICMPTypeNeighborAdvertisement:
 			if targetIp.Equal(peer.(*net.IPAddr).IP) {
 				result = Result{
 					Type: REACHABLE,
